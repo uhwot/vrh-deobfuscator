@@ -8,11 +8,8 @@ import {
 	VertexLayout,
 } from "@gltf-transform/core";
 import { KHRONOS_EXTENSIONS, EXTTextureWebP } from "@gltf-transform/extensions";
-import { existsSync, readdirSync } from "node:fs";
-import { mkdir, writeFile, readFile, unlink, readdir, rm, copyFile } from "node:fs/promises";
-import { DatabaseSync } from "node:sqlite";
-import os from "node:os";
-import path from "node:path";
+import { existsSync } from "node:fs";
+import { mkdir, writeFile, readFile, unlink, readdir, rm } from "node:fs/promises";
 import vm from "node:vm"
 import crypto from "node:crypto";
 import sharp from "sharp";
@@ -184,61 +181,6 @@ class RandomGenerator {
 		this._x = x
 	}
 }
-
-const multiplyQuaternions = (a, b) => {
-	const ax = a[0], ay = a[1], az = a[2], aw = a[3];
-	const bx = b[0], by = b[1], bz = b[2], bw = b[3];
-	return [
-		aw * bx + ax * bw + ay * bz - az * by,
-		aw * by - ax * bz + ay * bw + az * bx,
-		aw * bz + ax * by - ay * bx + az * bw,
-		aw * bw - ax * bx - ay * by - az * bz,
-	];
-};
-
-const rotateVectorByQuaternion = (vec, quat) => {
-	const vx = vec[0], vy = vec[1], vz = vec[2];
-	const qx = quat[0], qy = quat[1], qz = quat[2], qw = quat[3];
-	const uv = [
-		qy * vz - qz * vy,
-		qz * vx - qx * vz,
-		qx * vy - qy * vx,
-	];
-	const uuv = [
-		qy * uv[2] - qz * uv[1],
-		qz * uv[0] - qx * uv[2],
-		qx * uv[1] - qy * uv[0],
-	];
-	return [
-		vx + 2 * (qw * uv[0] + uuv[0]),
-		vy + 2 * (qw * uv[1] + uuv[1]),
-		vz + 2 * (qw * uv[2] + uuv[2]),
-	];
-};
-
-const rotateSceneForward = (doc) => {
-	const flipQuat = [0, 1, 0, 0];
-	const rootNodes = new Set();
-	for (const scene of doc.getRoot().listScenes()) {
-		for (const node of scene.listChildren()) {
-			rootNodes.add(node);
-		}
-	}
-
-	for (const node of rootNodes) {
-		const translation = node.getTranslation();
-		if (translation) {
-			node.setTranslation(rotateVectorByQuaternion(translation, flipQuat));
-		}
-
-		const rotation = node.getRotation();
-		if (rotation) {
-			node.setRotation(multiplyQuaternions(flipQuat, rotation));
-		} else {
-			node.setRotation([...flipQuat]);
-		}
-	}
-};
 
 class Deobfuscator {
 	constructor(seed, version, timestamp) {
@@ -697,52 +639,6 @@ export class PIXIVBasisExtension extends Extension {
 	}
 }
 
-// VRoid Hub now gates previews behind login (viewer_preview_usage_level: "login_user"),
-// so anonymous requests to /optimized_preview get a 404. We pull the logged-in session
-// cookie (_vroid_session, scoped to .vroid.com) straight out of the Firefox cookie store.
-async function getVRoidSessionCookie() {
-	const profilesDir = path.join(os.homedir(), "AppData", "Roaming", "Mozilla", "Firefox", "Profiles");
-	if (!existsSync(profilesDir)) return null;
-
-	const tmpDb = path.join(os.tmpdir(), `vrh_cookies_${process.pid}.sqlite`);
-
-	for (const profile of readdirSync(profilesDir)) {
-		const dbPath = path.join(profilesDir, profile, "cookies.sqlite");
-		if (!existsSync(dbPath)) continue;
-
-		// Copy the DB plus its WAL/SHM so recently-written cookies (which may not be
-		// checkpointed into the main file yet) are visible without touching the live store.
-		try {
-			await copyFile(dbPath, tmpDb);
-			for (const ext of ["-wal", "-shm"]) {
-				if (existsSync(dbPath + ext)) await copyFile(dbPath + ext, tmpDb + ext);
-			}
-		} catch {
-			continue;
-		}
-
-		try {
-			const db = new DatabaseSync(tmpDb, { readOnly: true });
-			const row = db
-				.prepare("SELECT value FROM moz_cookies WHERE host LIKE ? AND name = ?")
-				.get("%vroid.com%", "_vroid_session");
-			db.close();
-			if (row?.value) {
-				console.log(`Using VRoid session cookie from Firefox profile: ${profile}`);
-				return `_vroid_session=${row.value}`;
-			}
-		} catch {
-			// fall through to next profile
-		} finally {
-			for (const ext of ["", "-wal", "-shm"]) {
-				await rm(tmpDb + ext, { force: true }).catch(() => {});
-			}
-		}
-	}
-
-	return null;
-}
-
 async function deobfuscateVRoidHubGLB(id) {
 	console.log("Starting deobfuscation process for VRoid Hub GLB...");
 
@@ -774,17 +670,11 @@ async function deobfuscateVRoidHubGLB(id) {
 	} else {
 		console.log(`Fetching VRM data for ID: ${id}...`);
 		
-		const sessionCookie = await getVRoidSessionCookie();
-		if (!sessionCookie) {
-			console.warn("Warning: no VRoid session cookie found in Firefox. Login-gated previews will 404.");
-		}
-
 		const options = {
 			headers: {
 				"X-Api-Version": "11",
 				"User-Agent":
 					"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-				...(sessionCookie ? { Cookie: sessionCookie } : {}),
 			},
 		};
 		let response = await fetch(`https://hub.vroid.com/api/character_models/${id}/optimized_preview`, options);
@@ -882,8 +772,6 @@ async function deobfuscateVRoidHubGLB(id) {
 	
 	const deobfuscator = new Deobfuscator(seed, version, timestamp);
 	deobfuscator.processDocument(doc);
-	// VRoid preview GLBs face +Z; rotate 180° so exported VRMs look toward -Z like Unity/VRM expect.
-	// rotateSceneForward(doc);
 
 	const decoder = new KTX2Decoder();
 	const { BasisFile, initializeBasis } = await initialize();
